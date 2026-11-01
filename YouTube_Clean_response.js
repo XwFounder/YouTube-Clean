@@ -1,5 +1,5 @@
 /*
- * YouTube_Clean_response.js — v1.0
+ * YouTube_Clean_response.js — v1.1
  *
  * Loon http-response 脚本，作用于 https://youtubei.googleapis.com/youtubei/v1/*
  * （YouTube / YouTube Music iOS App，protobuf 响应体，binary-body-mode）
@@ -9,6 +9,8 @@
  *      browse / next / search 信息流里的广告条目（递归、与嵌套层级无关）；Shorts 里 isAd 的分片。
  *   2. 画中画 + 后台播放：player.playabilityStatus 打开 pictureInPictureAbility / backgroundAbility。
  *   3. 字幕翻译：在字幕轨里追加一条目标语言的译文轨（baseUrl + &tlang=），并设为默认音轨的默认字幕。
+ *      v1.1：基准轨按「可翻译 +4 / asr +2 / en +2」打分挑选（原来是"第一条 en 或第 0 条"，
+ *            遇到人工上传的不可翻译轨会造出加载失败的译文轨），译文轨继承基准轨的 kind。
  *   4. 歌词翻译：把 timedLyricsRender / 歌词 shelf 的文本按行翻译后写回。
  *   5. 底栏净化：guide 里按 browseId 隐藏 Shorts / 上传 / 选段 / 升级 入口。
  *   6. 后台播放开关：account/get_setting 里 backgroundPlayback 置 1。
@@ -512,16 +514,30 @@ function labelOf(text) {
   return encodeLD(1, encodeLD(1, utf8Encode(text)));
 }
 
-function buildTranslatedTrack(baseUrl, lang) {
-  // CaptionTrack{baseUrl=1, name=2(Label), vssId=3, languageCode=4, isTranslatable=7}
+function buildTranslatedTrack(baseUrl, lang, kind) {
+  // CaptionTrack{baseUrl=1, name=2(Label), vssId=3, languageCode=4, kind=5, isTranslatable=7}
   var parts = [
     encodeLD(1, utf8Encode(baseUrl)),
     encodeLD(2, labelOf("译文 " + lang)),
     encodeLD(3, utf8Encode("." + lang)),
-    encodeLD(4, utf8Encode(lang)),
-    encodeVarintField(7, 1)
+    encodeLD(4, utf8Encode(lang))
   ];
+  if (kind) parts.push(encodeLD(5, utf8Encode(kind)));   // 跟随基准轨：asr 轨派生的译文轨也得是 asr
+  parts.push(encodeVarintField(7, 1));
   return concat(parts);
+}
+
+/* 选翻译基准轨：服务端只对「可翻译」的轨接受 tlang。
+   打分：可翻译 +4、asr +2、en +2；目标语言轨不参与（它就是结果，不值得再翻译一次）。 */
+function trackScore(track, wantLang) {
+  var lang = getStr(track, 4) || "";
+  var kind = getStr(track, 5) || "";
+  var s = 0;
+  if (getVarint(track, 7) === 1) s += 4;
+  if (kind === "asr") s += 2;
+  if (lang === "en") s += 2;
+  if (lang === wantLang) s -= 8;
+  return s;
 }
 
 function packedInts(b, no) {
@@ -557,19 +573,29 @@ function translateCaptions(captions, lang) {
   var tracks = getRepeated(body, 1);
   if (tracks.length === 0) return captions;
 
-  var i, idx = -1, src = -1, base;
+  var i, idx = -1, src = -1, srcKind = "", base, score, best = -999;
   for (i = 0; i < tracks.length; i++) {
     if (getStr(tracks[i], 4) === lang) { idx = i; break; }
   }
   if (idx < 0) {
+    var anyTrans = false, anyFalse = false, anyAsr = false, flag;
     for (i = 0; i < tracks.length; i++) {
-      if (getStr(tracks[i], 4) === "en") { src = i; break; }
+      flag = getVarint(tracks[i], 7);
+      if (flag === 1) anyTrans = true; else if (flag === 0) anyFalse = true;
+      if (getStr(tracks[i], 5) === "asr") anyAsr = true;
     }
-    if (src < 0) src = 0;
+    // 服务端只对「可翻译」的轨接受 tlang：全部轨都明确标注不可翻译时不造轨道，否则 App 会报字幕加载失败
+    if (!anyTrans && !anyAsr && anyFalse) return captions;
+    for (i = 0; i < tracks.length; i++) {
+      score = trackScore(tracks[i], lang);
+      if (score > best) { best = score; src = i; }
+    }
+    if (src < 0) return captions;
     base = getStr(tracks[src], 1);
-    if (!base) return captions;                       // 没有 baseUrl 就不动，避免造出坏轨道
+    if (!base) return captions;                       // 没有 baseUrl 就不动
+    srcKind = getStr(tracks[src], 5) || "";
     if (base.indexOf("tlang=") < 0) base = base + (base.indexOf("?") < 0 ? "?" : "&") + "tlang=" + lang;
-    tracks.push(buildTranslatedTrack(base, lang));
+    tracks.push(buildTranslatedTrack(base, lang, srcKind));
     idx = tracks.length - 1;
   }
 
@@ -598,6 +624,9 @@ function translateCaptions(captions, lang) {
 
   // 自动翻译菜单
   body = replaceRepeated(body, 3, translationLanguages(lang));
+
+  // 轨道列表级别的默认字幕轨（没有 audioTracks 的响应也能默认开启字幕）
+  body = setVarint(body, 6, idx);
 
   return replaceRepeated(captions, 51621377, [body]);
 }
