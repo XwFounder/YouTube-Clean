@@ -1,0 +1,21 @@
+#!name=YouTube去广告（自编·精简版）
+#!desc=最小权限版:仅处理 youtubei.googleapis.com 的 protobuf 响应。移除视频、信息流、搜索和Shorts中的广告,可隐藏底栏Shorts/上传/选段/升级按钮;画中画、后台播放、字幕翻译为实验功能。脚本无网络、无存储、不读取请求头和Cookie,出错时原样放行。未实现:歌词翻译、googlevideo 层拦截。需启用MitM over HTTP/2和QUIC回退保护。
+#!author=自编; 字段编号参照 Maasea/sgmodule (Apache-2.0)
+#!tag=去广告
+#!system=iOS, iPadOS
+#!system_version=15
+#!loon_version=3.5.1(998)
+#!date=2026-11-01 00:00:00
+
+[Argument]
+blockUpload=switch, false, true, tag=隐藏上传按钮, desc=隐藏YouTube底栏的上传按钮(browseId 未经实机验证)
+blockShorts=switch, false, true, tag=隐藏Shorts按钮, desc=隐藏YouTube底栏的Shorts按钮
+blockImmersive=switch, false, true, tag=隐藏选段按钮, desc=隐藏YouTube Music底栏的选段按钮(browseId 未经实机验证)
+captionLang=select, "off", "zh-Hans", "zh-Hant", "ja", "ko", "en", tag=字幕翻译语言, desc=实验功能:通过YouTube自带的tlang参数翻译字幕,off为关闭
+debug=switch, false, true, tag=启用调试模式, desc=在日志中输出每个接口是否被修改(不输出任何请求内容)
+
+[Script]
+response if ${url} ~= /^https:\/\/youtubei\.googleapis\.com\/youtubei\/v1\/(browse|next|player|search|reel\/reel_watch_sequence|guide|account\/get_setting|get_watch)(\?(.*))?$/i then script("https://raw.githubusercontent.com/XwFounder/YouTube-Clean/5b9251a18fec51e93556a6a3e7531f5bef9a3f53/YouTube_Clean_response.js", {${blockUpload}, ${blockShorts}, ${blockImmersive}, ${captionLang}, ${debug}}) with tag="YouTube去广告(自编)", requires_body=true, binary_body_mode=true
+
+[MitM]
+hostname=youtubei.googleapis.com
