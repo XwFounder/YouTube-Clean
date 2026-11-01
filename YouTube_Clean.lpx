@@ -23,7 +23,7 @@ AND, ((DOMAIN-SUFFIX, youtubei.googleapis.com), (PROTOCOL, QUIC)), REJECT
 AND, ((DOMAIN-SUFFIX, googlevideo.com), (PROTOCOL, QUIC)), REJECT
 
 [Rewrite]
-request if ${url} ~= /^https?:\/\/[\w-]+\.googlevideo\.com\/initplayback.+&oad/i then reject(200)
+request if ${url} ~= /^https?:\/\/[\w-]+\.googlevideo\.com\/.*[?&]oad=/i then reject(200)
 
 [MitM]
 hostname=*.googlevideo.com, youtubei.googleapis.com
