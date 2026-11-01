@@ -1,39 +1,143 @@
 /*
- * YouTube_Clean_response.js  —  v0.1 (experimental)
+ * YouTube_Clean_response.js — v1.0
  *
- * Loon http-response script for https://youtubei.googleapis.com/youtubei/v1/*
- * (YouTube / YouTube Music iOS app, protobuf bodies, binary-body mode)
+ * Loon http-response 脚本，作用于 https://youtubei.googleapis.com/youtubei/v1/*
+ * （YouTube / YouTube Music iOS App，protobuf 响应体，binary-body-mode）
  *
- * SECURITY INVARIANTS (grep this file to check them):
- *   - No network access: no $httpClient / fetch / XMLHttpRequest / WebSocket
- *   - No storage: no $persistentStore / localStorage
- *   - No headers, cookies or tokens are read, written or logged
- *   - No eval / Function / dynamic code loading
- *   - Fail-open: on ANY error the original response is returned untouched
- *   - Edits are byte-splices: every field not explicitly changed stays byte-identical
- *   - The only I/O is reading $response body and calling $done()
+ * 功能
+ *   1. 去广告：player 的 adPlacements / adSlots / playbackTracking.pageadViewthroughconversion；
+ *      browse / next / search 信息流里的广告条目（递归、与嵌套层级无关）；Shorts 里 isAd 的分片。
+ *   2. 画中画 + 后台播放：player.playabilityStatus 打开 pictureInPictureAbility / backgroundAbility。
+ *   3. 字幕翻译：在字幕轨里追加一条目标语言的译文轨（baseUrl + &tlang=），并设为默认音轨的默认字幕。
+ *   4. 歌词翻译：把 timedLyricsRender / 歌词 shelf 的文本按行翻译后写回。
+ *   5. 底栏净化：guide 里按 browseId 隐藏 Shorts / 上传 / 选段 / 升级 入口。
+ *   6. 后台播放开关：account/get_setting 里 backgroundPlayback 置 1。
  *
- * PROVENANCE OF FIELD NUMBERS
- *   Field numbers come from the protobuf schema embedded in Maasea/sgmodule
- *   (Apache-2.0, build 2026/7/19 16:16:39). They were checked by reading,
- *   NOT by testing against a live YouTube app. See the "VERIFIED" tags below.
+ * 安全约束（可 grep 自证）
+ *   - 唯一的网络访问是注释中标了 [NET] 的歌词翻译请求（captionLang=off 时完全不联网）
+ *   - 不读写 $persistentStore / localStorage，不读取、不输出请求头与 Cookie
+ *   - 无 eval / Function / 动态代码
+ *   - 失败即放行（fail-open）：任何异常都返回原响应，绝不阻塞 App
+ *   - 改动是字节级 splice：未显式修改的字段逐字节保持不变
  *
- * Positional $argument order (same as the original plugin):
+ * 字段号来源：Maasea/sgmodule 内嵌的 protobuf schema（Apache-2.0, build 2026/7/19）
+ * 参数顺序（与 kelee 参考插件一致，兼容对象/数组两种 $argument）：
  *   blockUpload, blockShorts, blockImmersive, captionLang, debug
+ *   歌词翻译语言默认跟随 captionLang（可选 lyricLang 单独覆盖）
  */
 
 "use strict";
 
-/* ------------------------------------------------------------------ */
-/* 1. protobuf wire-format helpers (no schema, no re-encoding)         */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* 0. 常量                                                             */
+/* ================================================================== */
+
+var DEFAULT_CAPTION_LANG = "zh-Hans";  // 与参考插件 [Argument] captionLang 的默认值一致
+var MAX_DEPTH = 40;              // 递归深度上限（真实响应约 10~20 层）
+var WALK_BUDGET_FACTOR = 12;     // 单次深度遍历允许解析的字节数 = body.length * 12
+var LYRIC_TIMEOUT_MS = 4000;     // 单次翻译请求超时
+var LYRIC_TOTAL_MS = 9000;       // 歌词翻译总预算，超时直接放行
+var LYRIC_CHUNK_CHARS = 1400;    // 单个翻译请求的文本上限
+
+var TR_URL = "https://translate.googleapis.com/translate_a/single"; // [NET]
+
+// Player 层的广告字段（schema 已核实）
+var PLAYER_AD_FIELDS = [7, 68];
+var PLAYER_TRACKING = 9;
+var PLAYER_TRACKING_PAGEAD = 18;
+
+// 广告条目在字节里留下的特征值（都是只有广告体才会出现的字符串）
+var AD_MARKERS = ["pagead", "aboutthisad", "paralleladinteraction"];
+
+// 底栏 / 侧栏入口的 browseId（命中即隐藏）
+var GUIDE_IDS = {
+  shorts: ["FEshorts", "FEmusic_shorts"],
+  upload: ["FEuploads", "FEmusic_uploads"],
+  immersive: ["FEmusic_immersive", "FEmusic_clips"],
+  upgrade: ["SPunlimited", "FEmusic_premium", "FEmusic_upgrade"]
+};
+
+// 字幕翻译可选的译文语言（写进 translationLanguages，App 的"自动翻译"菜单用它）
+var LANG_NAMES = [
+  ["zh-Hans", "简体中文"],
+  ["zh-Hant", "繁體中文"],
+  ["en", "English"],
+  ["ja", "日本語"],
+  ["ko", "한국어"],
+  ["fr", "Français"],
+  ["de", "Deutsch"],
+  ["ru", "Русский"],
+  ["vi", "Tiếng Việt"],
+  ["fil", "Filipino"]
+];
+
+/* ================================================================== */
+/* 1. UTF-8（JSC 里没有 TextDecoder/TextEncoder，自己来）               */
+/* ================================================================== */
+
+function utf8Encode(str) {
+  var out = [], i, c, c2, cp;
+  for (i = 0; i < str.length; i++) {
+    c = str.charCodeAt(i);
+    if (c < 0x80) {
+      out.push(c);
+    } else if (c < 0x800) {
+      out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length &&
+               str.charCodeAt(i + 1) >= 0xdc00 && str.charCodeAt(i + 1) <= 0xdfff) {
+      c2 = str.charCodeAt(i + 1);
+      cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+      out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
+               0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+      i++;
+    } else if (c >= 0xd800 && c <= 0xdfff) {
+      out.push(0xef, 0xbf, 0xbd); // 落单的代理对 -> U+FFFD
+    } else {
+      out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    }
+  }
+  return new Uint8Array(out);
+}
+
+function utf8Decode(b) {
+  var s = "", i = 0, c, c1, c2, c3, cp;
+  while (i < b.length) {
+    c = b[i++];
+    if (c < 0x80) {
+      s += String.fromCharCode(c);
+    } else if (c >= 0xc0 && c < 0xe0) {
+      if (i >= b.length) break;
+      c1 = b[i++] & 0x3f;
+      s += String.fromCharCode(((c & 0x1f) << 6) | c1);
+    } else if (c >= 0xe0 && c < 0xf0) {
+      if (i + 1 >= b.length) break;
+      c1 = b[i++] & 0x3f;
+      c2 = b[i++] & 0x3f;
+      s += String.fromCharCode(((c & 0x0f) << 12) | (c1 << 6) | c2);
+    } else if (c >= 0xf0) {
+      if (i + 2 >= b.length) break;
+      c1 = b[i++] & 0x3f;
+      c2 = b[i++] & 0x3f;
+      c3 = b[i++] & 0x3f;
+      cp = (((c & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3) - 0x10000;
+      s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    } else {
+      s += "\ufffd";
+    }
+  }
+  return s;
+}
+
+/* ================================================================== */
+/* 2. protobuf 线格式（无 schema，只做定位与替换）                       */
+/* ================================================================== */
 
 function readVarint(b, p) {
-  // Arithmetic (not bitwise) so tags above 2^31 stay correct.
-  var v = 0, mul = 1;
+  // 用算术而不是位运算，tag 大于 2^31 时也正确
+  var v = 0, mul = 1, c;
   for (var i = 0; i < 10; i++) {
     if (p >= b.length) throw new Error("eof");
-    var c = b[p++];
+    c = b[p++];
     v += (c & 0x7f) * mul;
     if ((c & 0x80) === 0) return [v, p];
     mul *= 128;
@@ -49,43 +153,110 @@ function varint(n) {
 }
 
 function concat(arrs) {
-  var n = 0, i;
+  var n = 0, i, o = 0;
   for (i = 0; i < arrs.length; i++) n += arrs[i].length;
-  var out = new Uint8Array(n), o = 0;
+  var out = new Uint8Array(n);
   for (i = 0; i < arrs.length; i++) { out.set(arrs[i], o); o += arrs[i].length; }
   return out;
 }
 
 function encodeLD(no, payload) {
-  return concat([varint(no * 8 + 2), varint(payload.length), payload]);
+  return concat([new Uint8Array(varint(no * 8 + 2)), new Uint8Array(varint(payload.length)), payload]);
+}
+
+function encodeVarintField(no, val) {
+  return concat([new Uint8Array(varint(no * 8)), new Uint8Array(varint(val))]);
 }
 
 function parse(b) {
-  var out = [], p = 0;
+  var out = [], p = 0, s, t, no, wt, ps, pe;
   while (p < b.length) {
-    var s = p, t = readVarint(b, p);
+    s = p;
+    t = readVarint(b, p);
     p = t[1];
-    var no = Math.floor(t[0] / 8), wt = t[0] % 8, ps = p, pe;
+    no = Math.floor(t[0] / 8);
+    wt = t[0] % 8;
+    ps = p;
     if (no < 1) throw new Error("bad tag");
     if (wt === 0) { p = readVarint(b, p)[1]; pe = p; }
     else if (wt === 1) { p += 8; pe = p; }
     else if (wt === 5) { p += 4; pe = p; }
     else if (wt === 2) { var l = readVarint(b, p); p = l[1]; ps = p; p += l[0]; pe = p; }
     else throw new Error("unsupported wire type " + wt);
-    if (p > b.length) throw new Error("overrun");
+    if (p > b.length || p < ps) throw new Error("overrun");
     out.push({ no: no, wt: wt, s: s, e: p, ps: ps, pe: pe });
   }
   return out;
 }
 
-// fn(payload) -> undefined (keep) | null (drop) | Uint8Array (replace payload)
-function mapField(b, no, fn) {
-  var f = parse(b), parts = [], last = 0, changed = false;
-  for (var i = 0; i < f.length; i++) {
-    var x = f[i];
+function looksLikeMessage(b) {
+  if (!b || b.length < 2) return false;
+  try { parse(b); return true; } catch (e) { return false; }
+}
+
+// 同名（同字段号）重复字段的载荷列表
+function getRepeated(b, no) {
+  var f = parse(b), out = [], i;
+  for (i = 0; i < f.length; i++) if (f[i].no === no && f[i].wt === 2) out.push(b.subarray(f[i].ps, f[i].pe));
+  return out;
+}
+
+// 取第一个该字段号出现的位置（不限 wire type）
+function firstField(b, no) {
+  var f = parse(b), i;
+  for (i = 0; i < f.length; i++) if (f[i].no === no) return f[i];
+  return null;
+}
+
+function getStr(b, no) {
+  var x = firstField(b, no);
+  if (!x || x.wt !== 2) return undefined;
+  return utf8Decode(b.subarray(x.ps, x.pe));
+}
+
+function getStrPath(b, path) {
+  var cur = b, i, x, next;
+  for (i = 0; i < path.length; i++) {
+    x = firstField(cur, path[i]);
+    if (!x || x.wt !== 2) return undefined;
+    next = cur.subarray(x.ps, x.pe);
+    if (i === path.length - 1) return utf8Decode(next);
+    cur = next;
+  }
+  return undefined;
+}
+
+function getVarint(b, no) {
+  var x = firstField(b, no);
+  if (!x || x.wt !== 0) return undefined;
+  return readVarint(b, x.ps)[0];
+}
+
+function getVarintPath(b, path) {
+  var cur = b, i, x;
+  for (i = 0; i < path.length - 1; i++) {
+    x = firstField(cur, path[i]);
+    if (!x || x.wt !== 2) return undefined;
+    cur = cur.subarray(x.ps, x.pe);
+  }
+  return getVarint(cur, path[path.length - 1]);
+}
+
+function hasField(b, no) {
+  var f = parse(b), i;
+  for (i = 0; i < f.length; i++) if (f[i].no === no) return true;
+  return false;
+}
+
+// 对字段 no 的每一处 wt=2 载荷调用 fn：undefined/同引用=保留，null=删除，Uint8Array=替换
+function edit(b, no, fn) {
+  var f = parse(b), parts = [], last = 0, changed = false, i, x, payload, r;
+  for (i = 0; i < f.length; i++) {
+    x = f[i];
     if (x.no !== no || x.wt !== 2) continue;
-    var r = fn(b.subarray(x.ps, x.pe));
-    if (r === undefined) continue;
+    payload = b.subarray(x.ps, x.pe);
+    r = fn(payload);
+    if (r === undefined || r === payload) continue;
     parts.push(b.subarray(last, x.s));
     last = x.e;
     changed = true;
@@ -96,17 +267,9 @@ function mapField(b, no, fn) {
   return concat(parts);
 }
 
-// like mapField, but fn returns the same reference when nothing changed
-function edit(b, no, fn) {
-  return mapField(b, no, function (p) {
-    var r = fn(p);
-    return r === p ? undefined : r;
-  });
-}
-
 function dropFields(b, nos) {
-  var f = parse(b), parts = [], last = 0, changed = false;
-  for (var i = 0; i < f.length; i++) {
+  var f = parse(b), parts = [], last = 0, changed = false, i;
+  for (i = 0; i < f.length; i++) {
     if (nos.indexOf(f[i].no) >= 0) {
       parts.push(b.subarray(last, f[i].s));
       last = f[i].e;
@@ -118,340 +281,755 @@ function dropFields(b, nos) {
   return concat(parts);
 }
 
-function has(b, no) {
-  var f = parse(b);
-  for (var i = 0; i < f.length; i++) if (f[i].no === no) return true;
-  return false;
-}
-
-// read a varint scalar at a nested path; undefined if missing
-function getVarint(b, path) {
-  var f = parse(b);
-  for (var i = 0; i < f.length; i++) {
-    var x = f[i];
-    if (x.no !== path[0]) continue;
-    if (path.length === 1) return x.wt === 0 ? readVarint(b, x.ps)[0] : undefined;
-    if (x.wt !== 2) continue;
-    var r = getVarint(b.subarray(x.ps, x.pe), path.slice(1));
-    if (r !== undefined) return r;
-  }
-  return undefined;
-}
-
-// read an ASCII string at a nested path; undefined if missing / non-ASCII
-function getAscii(b, path) {
-  var f = parse(b);
-  for (var i = 0; i < f.length; i++) {
-    var x = f[i];
-    if (x.no !== path[0] || x.wt !== 2) continue;
-    var inner = b.subarray(x.ps, x.pe);
-    if (path.length === 1) {
-      var s = "";
-      for (var k = 0; k < inner.length; k++) {
-        if (inner[k] > 127) return undefined;
-        s += String.fromCharCode(inner[k]);
-      }
-      return s;
+// 把字段 no 的所有出现替换为 payloads（按原第一次出现的位置展开）
+function replaceRepeated(b, no, payloads) {
+  var f = parse(b), parts = [], last = 0, i, x, placed = false, k;
+  for (i = 0; i < f.length; i++) {
+    x = f[i];
+    if (x.no !== no) continue;
+    parts.push(b.subarray(last, x.s));
+    last = x.e;
+    if (!placed) {
+      placed = true;
+      for (k = 0; k < payloads.length; k++) parts.push(encodeLD(no, payloads[k]));
     }
-    var r = getAscii(inner, path.slice(1));
-    if (r !== undefined) return r;
   }
-  return undefined;
+  if (!placed) {
+    parts = [b];
+    for (k = 0; k < payloads.length; k++) parts.push(encodeLD(no, payloads[k]));
+    return concat(parts);
+  }
+  parts.push(b.subarray(last));
+  return concat(parts);
 }
 
-// set varint at path = [msg, msg, ..., leaf]; creates missing messages
-function setVarintAtPath(b, path, val) {
-  var no = path[0], rest = path.slice(1), f = parse(b), idx = -1, i;
-  for (i = 0; i < f.length; i++) if (f[i].no === no) { idx = i; break; }
-  if (rest.length === 0) {
-    var enc = concat([varint(no * 8), varint(val)]);
-    if (idx >= 0) {
-      if (f[idx].wt !== 0) return b;
-      if (readVarint(b, f[idx].ps)[0] === val) return b;
-      return concat([b.subarray(0, f[idx].s), enc, b.subarray(f[idx].e)]);
-    }
-    return concat([b, enc]);
+// 标量 varint 写入（重复出现只保留一个）
+function setVarint(b, no, val) {
+  var f = parse(b), occ = [], i, x, parts, last, placed;
+  for (i = 0; i < f.length; i++) if (f[i].no === no && f[i].wt === 0) occ.push(f[i]);
+  if (occ.length === 1 && readVarint(b, occ[0].ps)[0] === val) return b;
+  parts = [];
+  last = 0;
+  placed = false;
+  for (i = 0; i < f.length; i++) {
+    x = f[i];
+    if (x.no !== no || x.wt !== 0) continue;
+    parts.push(b.subarray(last, x.s));
+    last = x.e;
+    if (!placed) { parts.push(encodeVarintField(no, val)); placed = true; }
   }
-  if (idx >= 0) {
-    if (f[idx].wt !== 2) return b;
-    var inner = b.subarray(f[idx].ps, f[idx].pe);
-    var r = setVarintAtPath(inner, rest, val);
-    if (r === inner) return b;
-    return concat([b.subarray(0, f[idx].s), encodeLD(no, r), b.subarray(f[idx].e)]);
-  }
-  return concat([b, encodeLD(no, setVarintAtPath(new Uint8Array(0), rest, val))]);
+  if (!placed) return concat([b, encodeVarintField(no, val)]);
+  parts.push(b.subarray(last));
+  return concat(parts);
 }
 
-// apply fn to message field `no`; create it (empty) if absent
+// 字符串字段写入（覆盖第一次出现，删除多余出现）
+function setStr(b, no, str) {
+  return setBytes(b, no, utf8Encode(str));
+}
+
+function setBytes(b, no, bytes) {
+  return replaceRepeated(b, no, [bytes]);
+}
+
+// 字段 no 存在则就地改，不存在则追加
 function upsertMsg(b, no, fn) {
-  if (has(b, no)) return edit(b, no, fn);
+  if (hasField(b, no)) return edit(b, no, fn);
   return concat([b, encodeLD(no, fn(new Uint8Array(0)))]);
 }
 
+function appendLD(b, no, payload) {
+  return concat([b, encodeLD(no, payload)]);
+}
+
 function asciiBytes(s) {
-  var o = new Uint8Array(s.length);
-  for (var i = 0; i < s.length; i++) o[i] = s.charCodeAt(i) & 0x7f;
+  var o = new Uint8Array(s.length), i;
+  for (i = 0; i < s.length; i++) o[i] = s.charCodeAt(i) & 0x7f;
   return o;
 }
 
 function containsAscii(b, needle) {
-  var n = asciiBytes(needle), nl = n.length;
-  outer: for (var i = 0; i + nl <= b.length; i++) {
+  var n = asciiBytes(needle), nl = n.length, i, j, hit;
+  if (nl === 0 || nl > b.length) return false;
+  outer:
+  for (i = 0; i + nl <= b.length; i++) {
     if (b[i] !== n[0]) continue;
-    for (var j = 1; j < nl; j++) if (b[i + j] !== n[j]) continue outer;
-    return true;
+    hit = true;
+    for (j = 1; j < nl; j++) {
+      if (b[i + j] !== n[j]) { hit = false; break; }
+    }
+    if (hit) return true;
   }
   return false;
 }
 
-/* ------------------------------------------------------------------ */
-/* 2. features                                                         */
-/* ------------------------------------------------------------------ */
+/* ---- 深度遍历（与嵌套层级无关，带解析预算） ---- */
 
-// VERIFIED (schema): Player.adPlacements = 7, Player.adSlots = 68
-var PLAYER_AD_FIELDS = [7, 68];
+function newCtx(b) {
+  return { budget: Math.max(1 << 18, b.length * WALK_BUDGET_FACTOR * 3) };
+}
 
-// UNVERIFIED heuristic markers for feed ad items (from third-party reports)
-var FEED_AD_MARKERS = ["aboutthisad", "paralleladinteraction", "/pagead/"];
+function deepEdit(b, no, fn) {
+  return deepEditInner(b, function (n) { return n === no ? fn : null; }, 0, newCtx(b));
+}
 
-// UNVERIFIED browseIds of bottom-bar tabs (edit here if the app changes)
-var TAB_SHORTS = "FEshorts";
-var TAB_UPLOAD = "FEuploads";
-var TAB_IMMERSIVE = "FEmusic_immersive";
-var TAB_MUSIC_UPGRADE = "SPunlimited";
+// 一次遍历处理多个字段号：map 形如 {50195462: fn, 51431404: fn}
+function deepEditMulti(b, map) {
+  return deepEditInner(b, function (n) { return map[n] || null; }, 0, newCtx(b));
+}
 
-function isFeedAd(item) {
-  for (var i = 0; i < FEED_AD_MARKERS.length; i++)
-    if (containsAscii(item, FEED_AD_MARKERS[i])) return true;
+function deepEditInner(b, pick, depth, ctx) {
+  if (depth > MAX_DEPTH) return b;
+  ctx.budget -= b.length;
+  if (ctx.budget < 0) return b;
+  var f = parse(b), parts = [], last = 0, changed = false, i, x, payload, r, np, fn;
+  for (i = 0; i < f.length; i++) {
+    x = f[i];
+    if (x.wt !== 2) continue;
+    payload = b.subarray(x.ps, x.pe);
+    fn = pick(x.no);
+    if (fn) {
+      r = fn(payload, x.no);
+      if (r === undefined || r === payload) continue;
+      parts.push(b.subarray(last, x.s));
+      last = x.e;
+      changed = true;
+      if (r !== null) parts.push(encodeLD(x.no, r));
+      continue;
+    }
+    if (!looksLikeMessage(payload)) continue;
+    np = deepEditInner(payload, pick, depth + 1, ctx);
+    if (np === payload) continue;
+    parts.push(b.subarray(last, x.s));
+    parts.push(encodeLD(x.no, np));
+    last = x.e;
+    changed = true;
+  }
+  if (!changed) return b;
+  parts.push(b.subarray(last));
+  return concat(parts);
+}
+
+/* ================================================================== */
+/* 3. 广告                                                             */
+/* ================================================================== */
+
+function isAdBlob(b) {
+  var i;
+  for (i = 0; i < AD_MARKERS.length; i++) if (containsAscii(b, AD_MARKERS[i])) return true;
   return false;
 }
 
-// ---- /player and the player part of /get_watch ----------------------
+// 条目容器（schema 已核实）：
+//   ItemSectionRenderer=50195462.richItemContents=1
+//   ReelShelfRenderer=51431404.richItemContents=1
+// 只在这些容器的"条目槽位"上判广告，绝不按整棵子树判断 ——
+// 否则广告的祖先节点也含特征值，会把整块信息流一起删掉。
+function dropAdItems(sec) {
+  return edit(sec, 1, function (item) {
+    return isAdBlob(item) ? null : undefined;
+  });
+}
+
+function removeAds(b) {
+  var map = {};
+  map[50195462] = dropAdItems;
+  map[51431404] = dropAdItems;
+  return deepEditMulti(b, map);
+}
+
+// Shorts：入口的 command.reelWatchEndpoint.adClientParams.isAd == 1
+function isAdShortsEntry(p) {
+  var cmd, ep, params;
+  if (!looksLikeMessage(p)) return false;
+  var c = firstField(p, 1);
+  if (!c || c.wt !== 2) return false;
+  cmd = p.subarray(c.ps, c.pe);
+  var e = firstField(cmd, 139608561);
+  if (!e || e.wt !== 2) return false;
+  ep = cmd.subarray(e.ps, e.pe);
+  var a = firstField(ep, 16);
+  if (!a || a.wt !== 2) return false;
+  params = ep.subarray(a.ps, a.pe);
+  return getVarint(params, 1) === 1;
+}
+
+function stripShortsAds(b, depth, ctx) {
+  if (depth > MAX_DEPTH) return b;
+  ctx.budget -= b.length;
+  if (ctx.budget < 0) return b;
+  var f = parse(b), parts = [], last = 0, changed = false, i, x, payload, np;
+  for (i = 0; i < f.length; i++) {
+    x = f[i];
+    if (x.wt !== 2) continue;
+    payload = b.subarray(x.ps, x.pe);
+    if (isAdShortsEntry(payload)) {
+      parts.push(b.subarray(last, x.s));
+      last = x.e;
+      changed = true;
+      continue;
+    }
+    if (!looksLikeMessage(payload)) continue;
+    np = stripShortsAds(payload, depth + 1, ctx);
+    if (np === payload) continue;
+    parts.push(b.subarray(last, x.s));
+    parts.push(encodeLD(x.no, np));
+    last = x.e;
+    changed = true;
+  }
+  if (!changed) return b;
+  parts.push(b.subarray(last));
+  return concat(parts);
+}
+
+/* ================================================================== */
+/* 4. player：广告 + 画中画 + 后台播放 + 字幕翻译                        */
+/* ================================================================== */
+
+function enablePlayability(ps) {
+  // PlayabilityStatus.pictureInPictureRender=21 -> PictureInPictureSupportedRenderer
+  //   .pictureInPictureAbility=151635310 -> {active=1, f4=4, f6=6, f8=8}
+  ps = upsertMsg(ps, 21, function (pip) {
+    return upsertMsg(pip, 151635310, function (ab) {
+      ab = setVarint(ab, 1, 1);
+      ab = setVarint(ab, 4, 0);
+      ab = setVarint(ab, 6, 0);
+      ab = setVarint(ab, 8, 1);
+      return ab;
+    });
+  });
+  // PlayabilityStatus.backgroundPlayerRender=11 -> BackgroundSupportedRenderer
+  //   .backgroundAbility=64657230 -> {active=1}
+  return upsertMsg(ps, 11, function (bg) {
+    return upsertMsg(bg, 64657230, function (ab) {
+      return setVarint(ab, 1, 1);
+    });
+  });
+}
+
+function labelOf(text) {
+  // Label{runs:[Run{text}]}
+  return encodeLD(1, encodeLD(1, utf8Encode(text)));
+}
+
+function buildTranslatedTrack(baseUrl, lang) {
+  // CaptionTrack{baseUrl=1, name=2(Label), vssId=3, languageCode=4, isTranslatable=7}
+  var parts = [
+    encodeLD(1, utf8Encode(baseUrl)),
+    encodeLD(2, labelOf("译文 " + lang)),
+    encodeLD(3, utf8Encode("." + lang)),
+    encodeLD(4, utf8Encode(lang)),
+    encodeVarintField(7, 1)
+  ];
+  return concat(parts);
+}
+
+function packedInts(b, no) {
+  // captionTrackIndices 可能是 packed(wt2) 也可能是 unpacked(wt0)
+  var f = parse(b), out = [], i, j, x, p, t;
+  for (i = 0; i < f.length; i++) {
+    x = f[i];
+    if (x.no !== no) continue;
+    if (x.wt === 0) { out.push(readVarint(b, x.ps)[0]); continue; }
+    if (x.wt !== 2) continue;
+    p = x.ps;
+    while (p < x.pe) { t = readVarint(b, p); out.push(t[0]); p = t[1]; }
+  }
+  return out;
+}
+
+function translationLanguages(target) {
+  var list = [], i, langs = [], hit = false, name;
+  for (i = 0; i < LANG_NAMES.length; i++) langs.push(LANG_NAMES[i]);
+  for (i = 0; i < langs.length; i++) if (langs[i][0] === target) { hit = true; break; }
+  if (!hit) langs.unshift([target, target]);
+  for (i = 0; i < langs.length; i++) {
+    name = langs[i][1];
+    list.push(concat([encodeLD(1, utf8Encode(langs[i][0])), encodeLD(2, labelOf(name))]));
+  }
+  return list;
+}
+
+function translateCaptions(captions, lang) {
+  var list = firstField(captions, 51621377);
+  if (!list || list.wt !== 2) return captions;
+  var body = captions.subarray(list.ps, list.pe);
+  var tracks = getRepeated(body, 1);
+  if (tracks.length === 0) return captions;
+
+  var i, idx = -1, src = -1, base;
+  for (i = 0; i < tracks.length; i++) {
+    if (getStr(tracks[i], 4) === lang) { idx = i; break; }
+  }
+  if (idx < 0) {
+    for (i = 0; i < tracks.length; i++) {
+      if (getStr(tracks[i], 4) === "en") { src = i; break; }
+    }
+    if (src < 0) src = 0;
+    base = getStr(tracks[src], 1);
+    if (!base) return captions;                       // 没有 baseUrl 就不动，避免造出坏轨道
+    if (base.indexOf("tlang=") < 0) base = base + (base.indexOf("?") < 0 ? "?" : "&") + "tlang=" + lang;
+    tracks.push(buildTranslatedTrack(base, lang));
+    idx = tracks.length - 1;
+  }
+
+  // 所有轨道都允许被翻译
+  var n = [], k;
+  for (i = 0; i < tracks.length; i++) n.push(setVarint(tracks[i], 7, 1));
+  body = replaceRepeated(body, 1, n);
+
+  // 音轨：把译文轨挂上去并设为默认字幕
+  var audio = getRepeated(body, 2), na = [];
+  for (i = 0; i < audio.length; i++) {
+    var a = audio[i];
+    var inds = packedInts(a, 2);
+    if (inds.indexOf(idx) < 0) {
+      inds.push(idx);
+      // 合并成单个 packed 字段，避免出现两个 field 2
+      var pk = [], q;
+      for (q = 0; q < inds.length; q++) pk.push(new Uint8Array(varint(inds[q])));
+      a = replaceRepeated(a, 2, [concat(pk)]);
+    }
+    a = setVarint(a, 3, idx);        // defaultCaptionTrackIndex
+    a = setVarint(a, 11, 3);         // captionsInitialState = 字幕已开启
+    na.push(a);
+  }
+  if (na.length > 0) body = replaceRepeated(body, 2, na);
+
+  // 自动翻译菜单
+  body = replaceRepeated(body, 3, translationLanguages(lang));
+
+  return replaceRepeated(captions, 51621377, [body]);
+}
+
 function processPlayer(b, o) {
   b = dropFields(b, PLAYER_AD_FIELDS);
-
-  // EXPERIMENTAL: PiP + background play flags.
-  // Schema: Player.playabilityStatus=2; .pictureInPictureRender=21 ->
-  //   .pictureInPictureAbility=151635310 -> .active=1;
-  //   .backgroundPlayerRender=11 -> .backgroundAbility=64657230 -> .active=1
-  b = upsertMsg(b, 2, function (s) {
-    s = setVarintAtPath(s, [21, 151635310, 1], 1);
-    s = setVarintAtPath(s, [11, 64657230, 1], 1);
-    return s;
-  });
-
-  // EXPERIMENTAL: caption translation via YouTube's own `tlang` parameter.
-  // Schema: Player.captions=10 -> .playerCaptionsTrackListRenderer=51621377
-  //   -> .captionTracks=1 -> .baseUrl=1
+  b = edit(b, PLAYER_TRACKING, function (t) { return dropFields(t, [PLAYER_TRACKING_PAGEAD]); });
+  b = upsertMsg(b, 2, enablePlayability);              // Player.playabilityStatus=2
   if (o.captionLang !== "off") {
-    var add = asciiBytes("&tlang=" + o.captionLang);
-    b = edit(b, 10, function (c) {
-      return edit(c, 51621377, function (l) {
-        return edit(l, 1, function (t) {
-          return edit(t, 1, function (url) {
-            return containsAscii(url, "tlang=") ? url : concat([url, add]);
-          });
-        });
-      });
-    });
+    b = edit(b, 10, function (c) { return translateCaptions(c, o.captionLang); });
   }
   return b;
 }
 
-// ---- /get_watch ------------------------------------------------------
-// VERIFIED (schema): Watch.contents=1 -> Content.player=2, Content.next=3
-function processWatch(b, o) {
-  return edit(b, 1, function (c) {
-    c = edit(c, 2, function (p) { return processPlayer(p, o); });
-    c = edit(c, 3, function (n) { return processNextBody(n); });
-    return c;
-  });
+/* ================================================================== */
+/* 5. guide（底栏/侧栏入口）                                            */
+/* ================================================================== */
+
+function hiddenGuideIds(o) {
+  var ids = [];
+  ids = ids.concat(GUIDE_IDS.upgrade);
+  if (o.blockShorts) ids = ids.concat(GUIDE_IDS.shorts);
+  if (o.blockUpload) ids = ids.concat(GUIDE_IDS.upload);
+  if (o.blockImmersive) ids = ids.concat(GUIDE_IDS.immersive);
+  return ids;
 }
 
-// ---- feed filtering (browse / next / search) -------------------------
-// VERIFIED (schema paths):
-//   Content.sectionListRenderer=49399797 -> .sectionListSupportedRenderers=1
-//     -> .itemSectionRenderer=50195462 -> .richItemContents=1
-//     -> .shelfRenderer=51845067 -> .richSectionContent=5
-//        -> .reelShelfRenderer=51431404 -> .richItemContents=1
-//   Content.singleColumnResultsRenderer=58173949 -> .tabs=1
-//     -> .tabRenderer=58174010 -> .content=4 (Content)
-function filterItems(sec) {
-  return edit(sec, 1, function (item) { return isFeedAd(item) ? null : item; });
+function guideItemId(item) {
+  var id = getStrPath(item, [318370163, 1]);
+  if (id) return id;
+  return getStrPath(item, [117501096, 1]);
 }
-function sectionList(sl) {
-  return edit(sl, 1, function (sup) {
-    sup = edit(sup, 50195462, filterItems);
-    sup = edit(sup, 51845067, function (shelf) {
-      return edit(shelf, 5, function (rsc) { return edit(rsc, 51431404, filterItems); });
+
+function isHiddenGuideItem(item, ids) {
+  var id = guideItemId(item), k;
+  if (id !== undefined) {
+    for (k = 0; k < ids.length; k++) if (id === ids[k]) return true;
+    return false;
+  }
+  // 兜底：browseId 藏在别的层级时，按特征字符串判断
+  for (k = 0; k < ids.length; k++) if (containsAscii(item, ids[k])) return true;
+  return false;
+}
+
+function processGuide(b, o) {
+  var ids = hiddenGuideIds(o);
+  b = deepEdit(b, 117866661, function (sec) {
+    // GuideSectionRenderer.rendererItems=1
+    var out = edit(sec, 1, function (item) {
+      return isHiddenGuideItem(item, ids) ? null : undefined;
     });
-    return sup;
+    if (out !== sec && getRepeated(out, 1).length === 0) return null;  // 整段空了就删掉
+    return out;
   });
-}
-function content(c) {
-  c = edit(c, 49399797, sectionList);
-  c = edit(c, 58173949, function (sc) {
-    return edit(sc, 1, function (tab) {
-      return edit(tab, 58174010, function (tr) { return edit(tr, 4, content); });
-    });
-  });
-  return c;
+  // 删掉因此变空的 guide 项（Guide.labelItems=4 / iconItems=6）
+  var dropEmpty = function (item) { return item.length === 0 ? null : undefined; };
+  b = edit(b, 4, dropEmpty);
+  return edit(b, 6, dropEmpty);
 }
 
-// VERIFIED (schema): Browse.content=9, Browse.onResponseReceivedAction=10
-function processBrowse(b) {
-  b = edit(b, 9, content);
-  return edit(b, 10, content);
-}
-// VERIFIED (schema): Next.content=7 -> .nextResult=51779735 -> .content=1;
-//                    Next.onResponseReceivedAction=8
-function processNextBody(b) {
-  b = edit(b, 7, function (n) {
-    return edit(n, 51779735, function (nr) { return edit(nr, 1, content); });
-  });
-  return edit(b, 8, content);
-}
-// VERIFIED (schema): Search.content=4; Search.onResponseReceivedCommand=7
-//   -> .itemSectionRenderer=50195462, .appendContinuationItemsAction=49399797
-function processSearch(b) {
-  b = edit(b, 4, content);
-  return edit(b, 7, function (cmd) {
-    cmd = edit(cmd, 50195462, filterItems);
-    return edit(cmd, 49399797, sectionList);
-  });
-}
+/* ================================================================== */
+/* 6. account/get_setting：后台播放开关                                 */
+/* ================================================================== */
 
-// ---- Shorts: drop entries flagged as ads -----------------------------
-// VERIFIED (schema): Shorts.entries=2 -> Entry.command=1
-//   -> Command.reelWatchEndpoint=139608561 -> .adClientParams=16 -> .isAd=1
-function processShorts(b) {
-  return edit(b, 2, function (e) {
-    return getVarint(e, [1, 139608561, 16, 1]) === 1 ? null : e;
-  });
-}
-
-// ---- Guide: hide bottom-bar tabs by browseId -------------------------
-// VERIFIED (schema): Guide.labelItems=4 / iconItems=6 -> Item.guideSectionRenderer
-//   =117866661 -> .rendererItems=1 -> RendererItem.iconRender=318370163 /
-//   .labelRender=117501096 -> guideEntryRenderer.browseId=1
-function processGuide(b, hide) {
-  var itemFn = function (item) {
-    return edit(item, 117866661, function (sec) {
-      return edit(sec, 1, function (ri) {
-        var id = getAscii(ri, [318370163, 1]) || getAscii(ri, [117501096, 1]);
-        return id && hide[id] === true ? null : ri;
-      });
-    });
-  };
-  b = edit(b, 4, itemFn);
-  return edit(b, 6, itemFn);
-}
-
-// ---- Settings: expose the background-play switch ---------------------
-// VERIFIED (schema): Setting.settingItems=6 / CollectionItems=7 ->
-//   SettingItem.backgroundPlayBackSettingRenderer=88478200 -> .backgroundPlayback=2
 function processSettings(b) {
-  var fn = function (item) {
-    return has(item, 88478200)
-      ? edit(item, 88478200, function (r) { return setVarintAtPath(r, [2], 1); })
-      : item;
-  };
-  b = edit(b, 6, fn);
-  return edit(b, 7, fn);
+  return deepEdit(b, 88478200, function (r) {
+    // BackgroundPlayBackSettingRenderer.backgroundPlayback=2
+    return setVarint(r, 2, 1);
+  });
 }
 
-/* ------------------------------------------------------------------ */
-/* 3. arguments                                                        */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* 7. 歌词翻译                                                         */
+/* ================================================================== */
 
-function truthy(v) { return v === true || v === 1 || v === "true" || v === "1"; }
+function labelText(lab) {
+  var runs = getRepeated(lab, 1), out = [], i, t;
+  for (i = 0; i < runs.length; i++) {
+    t = getStr(runs[i], 1);
+    if (t !== undefined) out.push(t);
+  }
+  return out.join("");
+}
+
+// 遍历所有"歌词 run"：fnText(runText) -> 新文本 | undefined(不改)
+function mapLyricRuns(b, fnText) {
+  var rep = function (msg) {
+    return edit(msg, 1, function (run) {
+      var t = getStr(run, 1), nt;
+      if (t === undefined) return undefined;
+      nt = fnText(t);
+      if (nt === undefined || nt === t) return undefined;
+      return setStr(run, 1, nt);
+    });
+  };
+  // browse: VideoContent.timedLyricsRender=465160965 -> timedLyricsContent=4 -> runs=1
+  b = deepEdit(b, 465160965, function (tlr) {
+    return edit(tlr, 4, rep);
+  });
+  // MusicDescriptionShelfRenderer=221496734 -> description=3(Label) -> runs=1
+  b = deepEdit(b, 221496734, function (mds) {
+    if (!isLyricsShelf(mds)) return undefined;
+    return edit(mds, 3, rep);
+  });
+  return b;
+}
+
+// 只有"歌词"型 shelf 才翻：footer 里带 lyric/歌，或者描述本身就分成多行 run
+function isLyricsShelf(mds) {
+  var footer = firstField(mds, 10), ft = "", desc;
+  if (footer && footer.wt === 2) ft = labelText(mds.subarray(footer.ps, footer.pe));
+  if (/lyric|歌词|歌詞|letra|paroles|testo|tekst|lied|söz|가사/i.test(ft)) return true;
+  desc = getRepeated(mds, 3)[0];
+  return !!desc && getRepeated(desc, 1).length >= 3;
+}
+
+function lyricLines(b) {
+  var lines = [], seen = {}, push = function (t) {
+    var parts = String(t).split("\n"), i;
+    for (i = 0; i < parts.length; i++) {
+      var ln = parts[i];
+      if (ln === "" || seen["|" + ln]) continue;
+      seen["|" + ln] = true;
+      lines.push(ln);
+    }
+  };
+  mapLyricRuns(b, function (t) { push(t); return undefined; });
+  return lines;
+}
+
+function applyLineMap(b, map) {
+  return mapLyricRuns(b, function (t) {
+    var parts = t.split("\n"), changed = false, i, m, out = [];
+    for (i = 0; i < parts.length; i++) {
+      m = map[parts[i]];
+      if (m !== undefined && m !== "") { out.push(m); changed = true; }
+      else out.push(parts[i]);
+    }
+    return changed ? out.join("\n") : undefined;
+  });
+}
+
+/* [NET] 唯一的网络访问：谷歌翻译的免密接口 */
+function httpGet(url) {
+  return new Promise(function (resolve) {
+    var done = false, finish = function (v) { if (!done) { done = true; resolve(v); } };
+    var timer = setTimeout(function () { finish(null); }, LYRIC_TIMEOUT_MS);
+    var ok = function (body) { clearTimeout(timer); finish(typeof body === "string" ? body : null); };
+    var fail = function () { clearTimeout(timer); finish(null); };
+    try {
+      if (typeof $task !== "undefined" && $task && $task.fetch) {
+        $task.fetch({ url: url }).then(function (r) { ok(r && r.body); }, fail);
+      } else if (typeof $httpClient !== "undefined" && $httpClient && $httpClient.get) {
+        $httpClient.get({ url: url }, function (err, resp, body) { if (err) fail(); else ok(body); });
+      } else {
+        fail();
+      }
+    } catch (e) {
+      fail();
+    }
+  });
+}
+
+function parseTranslated(body) {
+  try {
+    var d = JSON.parse(body);
+    if (!d || !d[0]) return null;
+    var segs = d[0], out = [], i;
+    for (i = 0; i < segs.length; i++) if (segs[i] && typeof segs[i][0] === "string") out.push(segs[i][0]);
+    return out.join("");
+  } catch (e) {
+    return null;
+  }
+}
+
+function translateText(text, lang) {
+  var q;
+  try { q = encodeURIComponent(text); } catch (e) { return Promise.resolve(null); }
+  var url = TR_URL + "?client=gtx&dt=t&sl=auto&tl=" + encodeURIComponent(lang) + "&q=" + q;
+  return httpGet(url).then(function (body) {
+    if (!body) return null;
+    return parseTranslated(body);
+  }, function () { return null; });
+}
+
+function chunkLines(lines, max) {
+  var chunks = [], cur = [], len = 0, i, l;
+  for (i = 0; i < lines.length; i++) {
+    l = lines[i];
+    if (cur.length > 0 && len + l.length + 1 > max) { chunks.push(cur); cur = []; len = 0; }
+    cur.push(l);
+    len += l.length + 1;
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
+// 逐块翻译；只有"行数对得上"才认，对不上就整块放弃（避免把译文塞到错的行）
+function translateLines(lines, lang) {
+  var map = {}, chunks = chunkLines(lines, LYRIC_CHUNK_CHARS), idx = 0;
+  var next = function () {
+    if (idx >= chunks.length) return Promise.resolve(map);
+    var chunk = chunks[idx++];
+    return translateText(chunk.join("\n"), lang).then(function (out) {
+      if (out) {
+        var parts = out.split("\n");
+        if (parts.length === chunk.length) {
+          for (var i = 0; i < chunk.length; i++) {
+            var v = String(parts[i]).trim();
+            if (v !== "") map[chunk[i]] = v;
+          }
+        }
+      }
+      return next();
+    });
+  };
+  return next();
+}
+
+/* ================================================================== */
+/* 8. 参数                                                             */
+/* ================================================================== */
+
+/* 参数顺序与 kelee 参考插件一致（{${blockUpload}, ${blockShorts}, ${blockImmersive}, ${captionLang}, ${debug}}） */
+var ARG_ORDER = ["blockUpload", "blockShorts", "blockImmersive", "captionLang", "debug"];
+
+function truthy(v) {
+  return v === true || v === 1 || v === "true" || v === "1" || v === "on" || v === "yes";
+}
+
+function langOf(v, fallback) {
+  var s = String(v === undefined || v === null ? "" : v).trim();
+  if (!/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?$/.test(s)) return fallback;
+  return s;
+}
 
 function parseArgs(raw) {
-  var order = ["blockUpload", "blockShorts", "blockImmersive", "captionLang", "debug"];
-  var o = {};
+  var o = {}, i, s, parts;
   try {
     if (Array.isArray(raw)) {
-      for (var i = 0; i < order.length; i++) if (raw[i] !== undefined) o[order[i]] = raw[i];
+      for (i = 0; i < ARG_ORDER.length; i++) if (raw[i] !== undefined) o[ARG_ORDER[i]] = raw[i];
     } else if (raw && typeof raw === "object") {
       o = raw;
     } else if (typeof raw === "string") {
-      var s = raw.trim();
+      s = raw.trim();
       if (s.charAt(0) === "{" && s.indexOf(":") > 0) {
         o = JSON.parse(s);
       } else {
         s = s.replace(/^[\[{]\s*/, "").replace(/\s*[\]}]$/, "");
-        var parts = s.split(",");
-        for (var j = 0; j < order.length && j < parts.length; j++) {
-          o[order[j]] = parts[j].trim().replace(/^["']|["']$/g, "");
+        parts = s.split(",");
+        for (i = 0; i < ARG_ORDER.length && i < parts.length; i++) {
+          o[ARG_ORDER[i]] = parts[i].trim().replace(/^["']|["']$/g, "");
         }
       }
     }
   } catch (e) { o = {}; }
-  var lang = String(o.captionLang === undefined ? "off" : o.captionLang).trim();
-  // whitelist: this value is appended to a URL, so only language-code shapes pass
-  if (!/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?$/.test(lang)) lang = "off";
+  var capLang = langOf(o.captionLang === undefined ? DEFAULT_CAPTION_LANG : o.captionLang, "off");
   return {
     blockUpload: truthy(o.blockUpload),
     blockShorts: truthy(o.blockShorts),
     blockImmersive: truthy(o.blockImmersive),
-    captionLang: lang,
+    captionLang: capLang,
+    // 歌词翻译语言：未显式传入时跟随字幕语言（字幕关掉则歌词也不翻译）
+    lyricLang: langOf(o.lyricLang === undefined ? (capLang === "off" ? "off" : capLang) : o.lyricLang, "off"),
     debug: truthy(o.debug)
   };
 }
 
-/* ------------------------------------------------------------------ */
-/* 4. dispatcher                                                       */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* 9. 分发                                                             */
+/* ================================================================== */
+
+var FEED_ENDPOINTS = { browse: 1, next: 1, search: 1 };
 
 function transform(endpoint, body, o) {
-  switch (endpoint) {
-    case "player": return processPlayer(body, o);
-    case "get_watch": return processWatch(body, o);
-    case "browse": return processBrowse(body);
-    case "next": return processNextBody(body);
-    case "search": return processSearch(body);
-    case "reel/reel_watch_sequence": return processShorts(body);
-    case "account/get_setting": return processSettings(body);
+  var ep = String(endpoint || "").toLowerCase();
+  try {
+    return transformInner(ep, body, o);
+  } catch (e) {
+    // 任何异常都退回原始字节
+    return body;
+  }
+}
+
+function transformInner(ep, body, o) {
+  switch (ep) {
+    case "player":
+      return processPlayer(body, o);
+    case "get_watch":
+      // Watch.contents=1 -> Content{player=2, next=3}
+      return edit(body, 1, function (c) {
+        c = edit(c, 2, function (p) { return processPlayer(p, o); });
+        c = edit(c, 3, removeAds);
+        return c;
+      });
+    case "browse":
+      return removeAds(body);
+    case "next":
+    case "search":
+      return removeAds(body);
+    case "reel/reel_watch_sequence":
+    case "reel/reel_item_watch":
+      return stripShortsAds(body, 0, newCtx(body));
     case "guide":
-      var hide = {};
-      hide[TAB_MUSIC_UPGRADE] = true;
-      if (o.blockShorts) hide[TAB_SHORTS] = true;
-      if (o.blockUpload) hide[TAB_UPLOAD] = true;
-      if (o.blockImmersive) hide[TAB_IMMERSIVE] = true;
-      return processGuide(body, hide);
-    default: return body;
+      return processGuide(body, o);
+    case "account/get_setting":
+      return processSettings(body);
+    default:
+      return body;
+  }
+}
+
+function endpointOf(url) {
+  var m = /youtubei\.googleapis\.com\/youtubei\/v1\/([^?]*)/i.exec(String(url || ""));
+  if (!m) return "";
+  return m[1].replace(/\/+$/, "");
+}
+
+function supportsLyrics(ep) {
+  return ep === "browse" || ep === "player" || ep === "get_watch";
+}
+
+/* ================================================================== */
+/* 10. 主流程                                                          */
+/* ================================================================== */
+
+function toBytes(body) {
+  if (!body) return null;
+  if (typeof body === "string") return null;                  // 文本响应不动
+  if (body instanceof Uint8Array) return body;
+  if (typeof ArrayBuffer !== "undefined") {
+    if (body instanceof ArrayBuffer) return new Uint8Array(body);
+    if (body.buffer instanceof ArrayBuffer) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  }
+  return null;
+}
+
+function log(o, msg) {
+  if (o.debug && typeof console !== "undefined" && console.log) console.log("[YouTubeClean] " + msg);
+}
+
+function run(url, body, o, finish) {
+  var ep = endpointOf(url);
+  if (!ep) return finish(null);
+  var out;
+  try {
+    out = transform(ep, body, o);
+  } catch (e) {
+    log(o, ep + " transform failed, pass through: " + e);
+    return finish(null);
+  }
+
+  var translated;
+  if (o.lyricLang !== "off" && supportsLyrics(ep)) {
+    var lines;
+    try { lines = lyricLines(out); } catch (e) { lines = []; }
+    if (lines.length > 0) {
+      var deadline = false;
+      var guard = setTimeout(function () { deadline = true; finishOnce(out); }, LYRIC_TOTAL_MS);
+      translateLines(lines, o.lyricLang).then(function (map) {
+        clearTimeout(guard);
+        if (deadline) return;
+        var finalBytes = out;
+        try { finalBytes = applyLineMap(out, map); } catch (e) { finalBytes = out; }
+        finishOnce(finalBytes);
+      }, function () {
+        clearTimeout(guard);
+        if (!deadline) finishOnce(out);
+      });
+      return;
+    }
+  }
+  finishOnce(out);
+
+  function finishOnce(bytes) {
+    if (bytes === body) {
+      log(o, ep + ": unchanged");
+      return finish(null);
+    }
+    log(o, ep + ": " + body.length + " -> " + bytes.length + " bytes");
+    return finish(bytes);
   }
 }
 
 function main() {
   var o = parseArgs(typeof $argument === "undefined" ? undefined : $argument);
-  try {
-    var m = /^https:\/\/youtubei\.googleapis\.com\/youtubei\/v1\/([\w\/]+)/i.exec($request.url);
-    var body = $response.bodyBytes || $response.body;
-    if (!m || !body || typeof body === "string") return $done({});
-    if (body instanceof ArrayBuffer) body = new Uint8Array(body);
-    var ep = m[1].toLowerCase();
-    var out = transform(ep, body, o);
-    if (out === body) {
-      if (o.debug) console.log("[YouTubeClean] " + ep + ": no change");
-      return $done({});
+  var body = toBytes($response.bodyBytes || $response.body);
+  if (!body || body.length < 2) return $done({});
+
+  var finished = false;
+  var finish = function (bytes) {
+    if (finished) return;
+    finished = true;
+    try {
+      if (!bytes) return $done({});
+      return $done({ body: bytes });
+    } catch (e) {
+      try { return $done({}); } catch (e2) { /* 放弃 */ }
     }
-    if (o.debug) console.log("[YouTubeClean] " + ep + ": " + body.length + " -> " + out.length + " bytes");
-    return $done({ body: out });
+  };
+
+  try {
+    run($request.url, body, o, finish);
   } catch (e) {
-    if (o.debug) console.log("[YouTubeClean] error, passing through: " + e);
-    return $done({}); // fail-open
+    log(o, "fatal, pass through: " + e);
+    finish(null);
   }
 }
 
 if (typeof $done === "function" && typeof $response !== "undefined") {
   main();
 }
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    parse: parse, mapField: mapField, edit: edit, dropFields: dropFields,
-    setVarintAtPath: setVarintAtPath, getVarint: getVarint, getAscii: getAscii,
-    transform: transform, parseArgs: parseArgs, varint: varint, readVarint: readVarint,
-    encodeLD: encodeLD, concat: concat, containsAscii: containsAscii
+    // 线格式
+    parse: parse, readVarint: readVarint, varint: varint, concat: concat,
+    encodeLD: encodeLD, encodeVarintField: encodeVarintField,
+    edit: edit, dropFields: dropFields, replaceRepeated: replaceRepeated,
+    setVarint: setVarint, setStr: setStr, upsertMsg: upsertMsg, appendLD: appendLD,
+    getRepeated: getRepeated, getStr: getStr, getStrPath: getStrPath,
+    getVarint: getVarint, getVarintPath: getVarintPath, hasField: hasField,
+    deepEdit: deepEdit, deepEditMulti: deepEditMulti, containsAscii: containsAscii, packedInts: packedInts,
+    utf8Encode: utf8Encode, utf8Decode: utf8Decode, labelOf: labelOf,
+    // 特性
+    isAdBlob: isAdBlob, removeAds: removeAds, stripShortsAds: stripShortsAds,
+    processPlayer: processPlayer, processGuide: processGuide, processSettings: processSettings,
+    translateCaptions: translateCaptions, enablePlayability: enablePlayability,
+    lyricLines: lyricLines, applyLineMap: applyLineMap, mapLyricRuns: mapLyricRuns,
+    chunkLines: chunkLines, translateLines: translateLines,
+    // 入口
+    transform: transform, parseArgs: parseArgs, endpointOf: endpointOf,
+    run: run, main: main
   };
 }
