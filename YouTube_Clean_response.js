@@ -1,5 +1,5 @@
 /*
- * YouTube_Clean_response.js — v1.2
+ * YouTube_Clean_response.js — v1.3
  *
  * Loon http-response 脚本，作用于 https://youtubei.googleapis.com/youtubei/v1/*
  * （YouTube / YouTube Music iOS App，protobuf 响应体，binary-body-mode）
@@ -642,7 +642,7 @@ function processPlayer(b, o) {
   if (o.captionLang !== "off") {
     b = edit(b, 10, function (c) { return translateCaptions(c, o.captionLang); });
   }
-  log(o, adsBefore ? "player_fields_removed" : "player_fields_not_found");
+  logAlways(o, adsBefore ? "player_fields_removed" : "player_fields_not_found");
   return b;
 }
 
@@ -975,7 +975,15 @@ function toBytes(body) {
 }
 
 function log(o, msg) {
-  if (o.debug && typeof console !== "undefined" && console.log) console.log("[YouTubeClean] " + msg);
+  if (o.debug) logAlways(o, msg);
+}
+
+/* 诊断标记不受 debug 开关影响：插件参数在清缓存/更新后可能被重置为默认值，
+   而这几条是"脚本有没有跑到"的唯一证据，必须始终可见。 */
+function logAlways(o, msg) {
+  try {
+    if (typeof console !== "undefined" && console.log) console.log("[YouTubeClean] " + msg);
+  } catch (e) { /* 日志失败不影响主流程 */ }
 }
 
 function run(url, body, o, finish) {
@@ -985,7 +993,7 @@ function run(url, body, o, finish) {
   try {
     out = transform(ep, body, o);
   } catch (e) {
-    log(o, "protobuf_parse_failed " + ep + ": " + e);
+    logAlways(o, "protobuf_parse_failed " + ep + ": " + e);
     return finish(null);
   }
 
@@ -1013,10 +1021,10 @@ function run(url, body, o, finish) {
 
   function finishOnce(bytes) {
     if (bytes === body) {
-      log(o, "response_script_completed " + ep + " unchanged (" + (Date.now() - t0) + "ms)");
+      logAlways(o, "response_script_completed " + ep + " unchanged (" + (Date.now() - t0) + "ms)");
       return finish(null);
     }
-    log(o, "response_script_completed " + ep + " " + body.length + " -> " + bytes.length + " bytes (" + (Date.now() - t0) + "ms)");
+    logAlways(o, "response_script_completed " + ep + " " + body.length + " -> " + bytes.length + " bytes (" + (Date.now() - t0) + "ms)");
     return finish(bytes);
   }
 }
@@ -1024,9 +1032,9 @@ function run(url, body, o, finish) {
 function main() {
   var o = parseArgs(typeof $argument === "undefined" ? undefined : $argument);
   var body = toBytes($response.bodyBytes || $response.body);
-  log(o, "response_script_entered endpoint=" + endpointOf($request.url) + " bytes=" + (body ? body.length : 0));
+  logAlways(o, "response_script_entered endpoint=" + endpointOf($request.url) + " bytes=" + (body ? body.length : 0));
   if (!body || body.length < 2) {
-    log(o, "body_type_unsupported");
+    logAlways(o, "body_type_unsupported");
     return $done({});
   }
 
@@ -1045,7 +1053,7 @@ function main() {
   try {
     run($request.url, body, o, finish);
   } catch (e) {
-    log(o, "fatal, pass through: " + e);
+    logAlways(o, "fatal, pass through: " + e);
     finish(null);
   }
 }
@@ -1073,6 +1081,6 @@ if (typeof module !== "undefined" && module.exports) {
     chunkLines: chunkLines, translateLines: translateLines,
     // 入口
     transform: transform, parseArgs: parseArgs, endpointOf: endpointOf,
-    run: run, main: main
+    run: run, main: main, logAlways: logAlways
   };
 }
