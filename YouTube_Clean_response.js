@@ -1,5 +1,5 @@
 /*
- * YouTube_Clean_response.js — v1.1
+ * YouTube_Clean_response.js — v1.2
  *
  * Loon http-response 脚本，作用于 https://youtubei.googleapis.com/youtubei/v1/*
  * （YouTube / YouTube Music iOS App，protobuf 响应体，binary-body-mode）
@@ -632,14 +632,24 @@ function translateCaptions(captions, lang) {
 }
 
 function processPlayer(b, o) {
+  var adsBefore = hasField(b, 7) || hasField(b, 68) ||
+    (function () {
+      try { return getVarintPath(b, [PLAYER_TRACKING, PLAYER_TRACKING_PAGEAD]) !== null; } catch (e) { return false; }
+    })();
   b = dropFields(b, PLAYER_AD_FIELDS);
   b = edit(b, PLAYER_TRACKING, function (t) { return dropFields(t, [PLAYER_TRACKING_PAGEAD]); });
   b = upsertMsg(b, 2, enablePlayability);              // Player.playabilityStatus=2
   if (o.captionLang !== "off") {
     b = edit(b, 10, function (c) { return translateCaptions(c, o.captionLang); });
   }
+  log(o, adsBefore ? "player_fields_removed" : "player_fields_not_found");
   return b;
 }
+
+/* v1.2：debug 打开时输出结构化诊断标记，供定位"脚本是否跑到、广告字段是否在场"
+   response_script_entered / body_type_unsupported / protobuf_parse_failed /
+   player_fields_removed / player_fields_not_found / response_script_completed
+   不输出 Cookie、Authorization、令牌或完整请求头。 */
 
 /* ================================================================== */
 /* 5. guide（底栏/侧栏入口）                                            */
@@ -971,11 +981,11 @@ function log(o, msg) {
 function run(url, body, o, finish) {
   var ep = endpointOf(url);
   if (!ep) return finish(null);
-  var out;
+  var t0 = Date.now(), out;
   try {
     out = transform(ep, body, o);
   } catch (e) {
-    log(o, ep + " transform failed, pass through: " + e);
+    log(o, "protobuf_parse_failed " + ep + ": " + e);
     return finish(null);
   }
 
@@ -1003,10 +1013,10 @@ function run(url, body, o, finish) {
 
   function finishOnce(bytes) {
     if (bytes === body) {
-      log(o, ep + ": unchanged");
+      log(o, "response_script_completed " + ep + " unchanged (" + (Date.now() - t0) + "ms)");
       return finish(null);
     }
-    log(o, ep + ": " + body.length + " -> " + bytes.length + " bytes");
+    log(o, "response_script_completed " + ep + " " + body.length + " -> " + bytes.length + " bytes (" + (Date.now() - t0) + "ms)");
     return finish(bytes);
   }
 }
@@ -1014,7 +1024,11 @@ function run(url, body, o, finish) {
 function main() {
   var o = parseArgs(typeof $argument === "undefined" ? undefined : $argument);
   var body = toBytes($response.bodyBytes || $response.body);
-  if (!body || body.length < 2) return $done({});
+  log(o, "response_script_entered endpoint=" + endpointOf($request.url) + " bytes=" + (body ? body.length : 0));
+  if (!body || body.length < 2) {
+    log(o, "body_type_unsupported");
+    return $done({});
+  }
 
   var finished = false;
   var finish = function (bytes) {
