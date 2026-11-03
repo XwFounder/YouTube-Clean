@@ -1,5 +1,5 @@
 /*
- * YouTube_Clean_response.js — v1.3
+ * YouTube_Clean_response.js — v1.1
  *
  * Loon http-response 脚本，作用于 https://youtubei.googleapis.com/youtubei/v1/*
  * （YouTube / YouTube Music iOS App，protobuf 响应体，binary-body-mode）
@@ -632,24 +632,14 @@ function translateCaptions(captions, lang) {
 }
 
 function processPlayer(b, o) {
-  var adsBefore = hasField(b, 7) || hasField(b, 68) ||
-    (function () {
-      try { return getVarintPath(b, [PLAYER_TRACKING, PLAYER_TRACKING_PAGEAD]) !== null; } catch (e) { return false; }
-    })();
   b = dropFields(b, PLAYER_AD_FIELDS);
   b = edit(b, PLAYER_TRACKING, function (t) { return dropFields(t, [PLAYER_TRACKING_PAGEAD]); });
   b = upsertMsg(b, 2, enablePlayability);              // Player.playabilityStatus=2
   if (o.captionLang !== "off") {
     b = edit(b, 10, function (c) { return translateCaptions(c, o.captionLang); });
   }
-  logAlways(o, adsBefore ? "player_fields_removed" : "player_fields_not_found");
   return b;
 }
-
-/* v1.2：debug 打开时输出结构化诊断标记，供定位"脚本是否跑到、广告字段是否在场"
-   response_script_entered / body_type_unsupported / protobuf_parse_failed /
-   player_fields_removed / player_fields_not_found / response_script_completed
-   不输出 Cookie、Authorization、令牌或完整请求头。 */
 
 /* ================================================================== */
 /* 5. guide（底栏/侧栏入口）                                            */
@@ -975,25 +965,17 @@ function toBytes(body) {
 }
 
 function log(o, msg) {
-  if (o.debug) logAlways(o, msg);
-}
-
-/* 诊断标记不受 debug 开关影响：插件参数在清缓存/更新后可能被重置为默认值，
-   而这几条是"脚本有没有跑到"的唯一证据，必须始终可见。 */
-function logAlways(o, msg) {
-  try {
-    if (typeof console !== "undefined" && console.log) console.log("[YouTubeClean] " + msg);
-  } catch (e) { /* 日志失败不影响主流程 */ }
+  if (o.debug && typeof console !== "undefined" && console.log) console.log("[YouTubeClean] " + msg);
 }
 
 function run(url, body, o, finish) {
   var ep = endpointOf(url);
   if (!ep) return finish(null);
-  var t0 = Date.now(), out;
+  var out;
   try {
     out = transform(ep, body, o);
   } catch (e) {
-    logAlways(o, "protobuf_parse_failed " + ep + ": " + e);
+    log(o, ep + " transform failed, pass through: " + e);
     return finish(null);
   }
 
@@ -1021,10 +1003,10 @@ function run(url, body, o, finish) {
 
   function finishOnce(bytes) {
     if (bytes === body) {
-      logAlways(o, "response_script_completed " + ep + " unchanged (" + (Date.now() - t0) + "ms)");
+      log(o, ep + ": unchanged");
       return finish(null);
     }
-    logAlways(o, "response_script_completed " + ep + " " + body.length + " -> " + bytes.length + " bytes (" + (Date.now() - t0) + "ms)");
+    log(o, ep + ": " + body.length + " -> " + bytes.length + " bytes");
     return finish(bytes);
   }
 }
@@ -1032,11 +1014,7 @@ function run(url, body, o, finish) {
 function main() {
   var o = parseArgs(typeof $argument === "undefined" ? undefined : $argument);
   var body = toBytes($response.bodyBytes || $response.body);
-  logAlways(o, "response_script_entered endpoint=" + endpointOf($request.url) + " bytes=" + (body ? body.length : 0));
-  if (!body || body.length < 2) {
-    logAlways(o, "body_type_unsupported");
-    return $done({});
-  }
+  if (!body || body.length < 2) return $done({});
 
   var finished = false;
   var finish = function (bytes) {
@@ -1053,7 +1031,7 @@ function main() {
   try {
     run($request.url, body, o, finish);
   } catch (e) {
-    logAlways(o, "fatal, pass through: " + e);
+    log(o, "fatal, pass through: " + e);
     finish(null);
   }
 }
@@ -1081,6 +1059,6 @@ if (typeof module !== "undefined" && module.exports) {
     chunkLines: chunkLines, translateLines: translateLines,
     // 入口
     transform: transform, parseArgs: parseArgs, endpointOf: endpointOf,
-    run: run, main: main, logAlways: logAlways
+    run: run, main: main
   };
 }
